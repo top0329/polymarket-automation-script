@@ -50,7 +50,7 @@ async def identify(ws):
             },
             "compress": True,
             "large_threshold": 50,
-            "intents": 513
+            "intents": 32767
         }
     }
     await send_payload(ws, identify_payload)
@@ -77,10 +77,16 @@ async def on_message(ws):
 
                 if event_type == 'MESSAGE_CREATE':
                     channel_id = event['d']['channel_id']
-                    if channel_id == "776127689227894803": # the channel id of new-markets
+                    if channel_id == "1343921888459755543": # the channel id of new-markets
                         # message content
+                        # content = event['d']['content']
+                        # print(content)
+
                         content = event['d']['content']
-                        print(content)
+                        author = event['d']['author']
+                        print(f"Author: {author['username']}#{author['discriminator']}")
+                        print(f"Content: {content}")
+                        logger.info(f"Message received from {author['username']}: {content}")
 
             elif op_code == 9:
                 logging.info(f"Invalid session. Starting a new session...")
