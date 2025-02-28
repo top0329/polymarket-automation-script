@@ -7,6 +7,10 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, BotCommand, MenuButtonDefault, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import filters, ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, ConversationHandler
+from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType
+from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client.client import ClobClient
+from pymongo import MongoClient
 
 logging.basicConfig(
   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -22,9 +26,21 @@ GAMMA_ENDPOINT = os.getenv('GAMMA_ENDPOINT')
 CLOB_API_KEY = os.getenv('CLOB_API_KEY')
 CLOB_SECRET = os.getenv('CLOB_SECRET')
 CLOB_PASS_PHRASE = os.getenv('CLOB_PASS_PHRASE')
+MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017')
+CLOB_HTTP_URL = os.getenv('CLOB_HTTP_URL')
+PRIVATE_KEY = os.getenv('PRIVATE_KEY')
+CHAIN_ID = int(os.getenv('CHAIN_ID', '1'))
+
+# Initialize MongoDB client
+mongo_client = MongoClient(MONGODB_URI)
+db = mongo_client.polymarket
+orders_collection = db.orders
+
+# Initialize CLOB client
+clob_client = ClobClient(CLOB_HTTP_URL, key=PRIVATE_KEY, chain_id=CHAIN_ID)
 
 # States for order conversation
-SELECTING_OUTCOME, ENTERING_AMOUNT, ENTERING_PRICE = range(3)
+SELECTING_OUTCOME, ENTERING_AMOUNT, ENTERING_PRICE, SELECTING_SIDE = range(4)
 
 # Global variables
 subscribed_chats = set()
@@ -241,6 +257,10 @@ async def handle_market_order(update: Update, context: ContextTypes.DEFAULT_TYPE
         response = requests.get(f"{GAMMA_ENDPOINT}/markets/{market_id}")
         market_data = response.json()
         outcomes = json.loads(market_data['outcomes'])
+        token_ids = json.loads(market_data.get('tokenIds', '[]'))
+
+        # Store token IDs mapped to outcomes
+        context.user_data['token_ids'] = dict(zip(outcomes, token_ids))
 
         # Create outcome selection buttons
         keyboard = [[InlineKeyboardButton(outcome, callback_data=f"outcome:{outcome}")]
@@ -272,6 +292,10 @@ async def handle_limit_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
         response = requests.get(f"{GAMMA_ENDPOINT}/markets/{market_id}")
         market_data = response.json()
         outcomes = json.loads(market_data['outcomes'])
+        token_ids = json.loads(market_data.get('tokenIds', '[]'))
+
+        # Store token IDs mapped to outcomes
+        context.user_data['token_ids'] = dict(zip(outcomes, token_ids))
 
         # Create outcome selection buttons
         keyboard = [[InlineKeyboardButton(outcome, callback_data=f"outcome:{outcome}")]
@@ -294,9 +318,31 @@ async def handle_outcome_selection(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     outcome = query.data.split(':')[1]
     context.user_data['selected_outcome'] = outcome
+    context.user_data['token_id'] = context.user_data['token_ids'][outcome]
+
+    # Create side selection buttons
+    keyboard = [
+        [
+            InlineKeyboardButton("Buy", callback_data="side:buy"),
+            InlineKeyboardButton("Sell", callback_data="side:sell")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
     await query.edit_message_text(
-        text=f"Selected outcome: {outcome}\nEnter the amount you want to trade (in USD):"
+        text=f"Selected outcome: {outcome}\nDo you want to buy or sell?",
+        reply_markup=reply_markup
+    )
+    return SELECTING_SIDE
+
+async def handle_side_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle side selection"""
+    query = update.callback_query
+    side = query.data.split(':')[1]
+    context.user_data['side'] = BUY if side.lower() == 'buy' else SELL
+
+    await query.edit_message_text(
+        text=f"Enter the amount you want to trade (in {'USD' if context.user_data['side'] == BUY else 'shares'}):"
     )
     return ENTERING_AMOUNT
 
@@ -343,43 +389,75 @@ async def handle_price_entry(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ENTERING_PRICE
 
 async def place_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Place the actual order using Polymarket API"""
+    """Place the actual order using Polymarket CLOB API"""
     try:
+        token_id = context.user_data['token_id']
+        amount = context.user_data['amount']
+        side = context.user_data['side']
+
         order_data = {
+            "user_id": update.effective_user.id,
             "market_id": context.user_data['market_id'],
             "outcome": context.user_data['selected_outcome'],
-            "amount": context.user_data['amount'],
-            "type": context.user_data['order_type']
+            "token_id": token_id,
+            "amount": amount,
+            "side": "BUY" if side == BUY else "SELL",
+            "type": context.user_data['order_type'],
+            "status": "pending",
+            "created_at": datetime.now(timezone.utc),
         }
 
-        if order_data['type'] == 'limit':
-            order_data['price'] = context.user_data['price']
+        if context.user_data['order_type'] == 'limit':
+            price = context.user_data['price']
+            order_data['price'] = price
 
-        # Add your Polymarket API order placement code here
-        # This is a placeholder for the actual API call
-        headers = {
-            "API-KEY": CLOB_API_KEY,
-            "API-SECRET": CLOB_SECRET,
-            "API-PASSPHRASE": CLOB_PASS_PHRASE
-        }
+            # Create and sign a limit order
+            order_args = OrderArgs(
+                price=price,
+                size=amount,
+                side=side,
+                token_id=token_id
+            )
+            signed_order = clob_client.create_order(order_args)
+            resp = clob_client.post_order(signed_order, OrderType.GTC)
+        else:
+            # Create and sign a market order
+            order_args = MarketOrderArgs(
+                token_id=token_id,
+                amount=amount,
+                side=side
+            )
+            signed_order = clob_client.create_market_order(order_args)
+            resp = clob_client.post_order(signed_order, OrderType.FOK)
 
-        # Example API endpoint (replace with actual endpoint)
-        response = requests.post(
-            f"{GAMMA_ENDPOINT}/orders",
-            json=order_data,
-            headers=headers
-        )
+        # Update order data with response
+        order_data.update({
+            "order_id": resp.get("orderID"),
+            "transaction_hashes": resp.get("transactionsHashes", []),
+            "status": "success" if resp.get("success") else "failed",
+            "error_message": resp.get("errorMsg", "")
+        })
 
-        if response.status_code == 200:
-            await update.message.reply_text(
+        # Save order to MongoDB
+        orders_collection.insert_one(order_data)
+
+        # Send response to user
+        if resp.get("success"):
+            message = (
                 f"Order placed successfully!\n"
                 f"Type: {order_data['type'].title()} Order\n"
+                f"Side: {order_data['side']}\n"
                 f"Outcome: {order_data['outcome']}\n"
-                f"Amount: ${order_data['amount']}"
+                f"Amount: {'$' if order_data['side'] == 'BUY' else ''}{order_data['amount']}"
             )
+            if order_data['type'] == 'limit':
+                message += f"\nPrice: ${order_data['price']}"
+
+            await update.message.reply_text(message)
         else:
+            error_msg = resp.get("errorMsg", "Unknown error")
             await update.message.reply_text(
-                "Failed to place order. Please try again later."
+                f"Failed to place order: {error_msg}\nPlease try again later."
             )
 
     except Exception as e:
@@ -409,6 +487,7 @@ if __name__ == '__main__':
         ],
         states={
             SELECTING_OUTCOME: [CallbackQueryHandler(handle_outcome_selection, pattern=r'^outcome:')],
+            SELECTING_SIDE: [CallbackQueryHandler(handle_side_selection, pattern=r'^side:')],
             ENTERING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_amount_entry)],
             ENTERING_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_price_entry)]
         },
