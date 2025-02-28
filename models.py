@@ -2,6 +2,9 @@ from datetime import datetime
 from typing import List, Optional
 from pymongo import MongoClient
 from bson import ObjectId
+import logging
+
+logger = logging.getLogger(__name__)
 
 class OrderSchema:
     """MongoDB schema for orders"""
@@ -72,57 +75,98 @@ class MongoDBHandler:
     """Handler for MongoDB operations"""
 
     def __init__(self, uri: str = "mongodb://localhost:27017"):
-        self.client = MongoClient(uri)
-        self.db = self.client.polymarket
-        self.orders = self.db.orders
-        self.order_schema = OrderSchema()
+        try:
+            self.client = MongoClient(uri)
+            # Test the connection
+            self.client.admin.command('ping')
+            logger.info("✅ Successfully connected to MongoDB!")
 
-        # Create indexes
-        self._create_indexes()
+            self.db = self.client.polymarket
+            self.orders = self.db.orders
+            self.order_schema = OrderSchema()
+
+            # Create indexes
+            self._create_indexes()
+            logger.info("✅ MongoDB indexes created successfully!")
+
+        except Exception as e:
+            logger.error(f"❌ Failed to connect to MongoDB: {str(e)}")
+            raise
 
     def _create_indexes(self):
         """Create necessary indexes for the orders collection"""
-        self.orders.create_index([("user_id", 1)])
-        self.orders.create_index([("market_id", 1)])
-        self.orders.create_index([("created_at", -1)])
-        self.orders.create_index([("status", 1)])
+        try:
+            self.orders.create_index([("user_id", 1)])
+            self.orders.create_index([("market_id", 1)])
+            self.orders.create_index([("created_at", -1)])
+            self.orders.create_index([("status", 1)])
+            logger.debug("Created MongoDB indexes for orders collection")
+        except Exception as e:
+            logger.error(f"Failed to create MongoDB indexes: {str(e)}")
+            raise
 
     def save_order(self, order_data: dict) -> bool:
         """Save order to MongoDB"""
-        if not self.order_schema.validate_order(order_data):
-            return False
+        try:
+            if not self.order_schema.validate_order(order_data):
+                logger.error("Invalid order data format")
+                return False
 
-        order_data["updated_at"] = datetime.utcnow()
-        result = self.orders.insert_one(order_data)
-        return bool(result.inserted_id)
+            order_data["updated_at"] = datetime.utcnow()
+            result = self.orders.insert_one(order_data)
+            logger.info(f"Order saved successfully with ID: {result.inserted_id}")
+            return bool(result.inserted_id)
+        except Exception as e:
+            logger.error(f"Failed to save order to MongoDB: {str(e)}")
+            return False
 
     def update_order_status(self, order_id: str, status: str, error_message: str = None) -> bool:
         """Update order status"""
-        update_data = {
-            "status": status,
-            "updated_at": datetime.utcnow()
-        }
-        if error_message:
-            update_data["error_message"] = error_message
+        try:
+            update_data = {
+                "status": status,
+                "updated_at": datetime.utcnow()
+            }
+            if error_message:
+                update_data["error_message"] = error_message
 
-        result = self.orders.update_one(
-            {"_id": ObjectId(order_id)},
-            {"$set": update_data}
-        )
-        return result.modified_count > 0
+            result = self.orders.update_one(
+                {"_id": ObjectId(order_id)},
+                {"$set": update_data}
+            )
+            if result.modified_count > 0:
+                logger.info(f"Order {order_id} status updated to: {status}")
+            else:
+                logger.warning(f"Order {order_id} not found or status not changed")
+            return result.modified_count > 0
+        except Exception as e:
+            logger.error(f"Failed to update order status: {str(e)}")
+            return False
 
     def get_user_orders(self, user_id: int, limit: int = 10) -> List[dict]:
         """Get user's orders sorted by creation date"""
-        return list(
-            self.orders.find({"user_id": user_id})
-            .sort("created_at", -1)
-            .limit(limit)
-        )
+        try:
+            orders = list(
+                self.orders.find({"user_id": user_id})
+                .sort("created_at", -1)
+                .limit(limit)
+            )
+            logger.info(f"Retrieved {len(orders)} orders for user {user_id}")
+            return orders
+        except Exception as e:
+            logger.error(f"Failed to fetch user orders: {str(e)}")
+            return []
 
     def get_market_orders(self, market_id: str, limit: int = 10) -> List[dict]:
         """Get orders for a specific market"""
-        return list(
-            self.orders.find({"market_id": market_id})
-            .sort("created_at", -1)
-            .limit(limit)
-        )
+        try:
+            orders = list(
+                self.orders.find({"market_id": market_id})
+                .sort("created_at", -1)
+                .limit(limit)
+            )
+            logger.info(f"Retrieved {len(orders)} orders for market {market_id}")
+            return orders
+        except Exception as e:
+            logger.error(f"Failed to fetch market orders: {str(e)}")
+            return []

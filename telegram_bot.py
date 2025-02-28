@@ -7,10 +7,14 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, BotCommand, MenuButtonDefault, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import filters, ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, ConversationHandler
+from warnings import filterwarnings
+from telegram.warnings import PTBUserWarning
 from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY, SELL
 from py_clob_client.client import ClobClient
-from pymongo import MongoClient
+from models import MongoDBHandler
+
+filterwarnings(action="ignore", message=r".*CallbackQueryHandler", category=PTBUserWarning)
 
 logging.basicConfig(
   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -19,6 +23,24 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+def init_services():
+    """Initialize external services and connections"""
+    try:
+        # Initialize MongoDB handler
+        logger.info("Connecting to MongoDB...")
+        mongo_handler = MongoDBHandler(MONGODB_URI)
+
+        # Initialize CLOB client
+        logger.info("Initializing CLOB client...")
+        clob_client = ClobClient(CLOB_HTTP_URL, key=PRIVATE_KEY, chain_id=CHAIN_ID)
+        logger.info("✅ CLOB client initialized successfully!")
+
+        return mongo_handler, clob_client
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize services: {str(e)}")
+        raise
+
+# Load environment variables
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -29,15 +51,15 @@ CLOB_PASS_PHRASE = os.getenv('CLOB_PASS_PHRASE')
 MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017')
 CLOB_HTTP_URL = os.getenv('CLOB_HTTP_URL')
 PRIVATE_KEY = os.getenv('PRIVATE_KEY')
-CHAIN_ID = int(os.getenv('CHAIN_ID', '1'))
+CHAIN_ID = int(os.getenv('CHAIN_ID', '137'))
 
-# Initialize MongoDB client
-mongo_client = MongoClient(MONGODB_URI)
-db = mongo_client.polymarket
-orders_collection = db.orders
-
-# Initialize CLOB client
-clob_client = ClobClient(CLOB_HTTP_URL, key=PRIVATE_KEY, chain_id=CHAIN_ID)
+# Initialize services
+try:
+    mongo_handler, clob_client = init_services()
+    logger.info("✅ All services initialized successfully!")
+except Exception as e:
+    logger.error("❌ Failed to initialize required services. Exiting...")
+    raise SystemExit(1)
 
 # States for order conversation
 SELECTING_OUTCOME, ENTERING_AMOUNT, ENTERING_PRICE, SELECTING_SIDE = range(4)
@@ -100,8 +122,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
              "• /start - Show the main menu\n"
              "• /subscribe - Get new market alerts\n"
              "• /unsubscribe - Stop market alerts\n"
+             "• /orders - View your order history\n"
+             "• /market_orders <market_id> - View orders for a specific market\n"
+             "• /status - Check connection status of services\n"
              "• /help - Show this help message\n\n"
-             "ℹ️ This bot monitors Polymarket for new markets and sends alerts when they are created.",
+             "ℹ️ This bot monitors Polymarket for new markets and sends alerts when they are created.\n\n"
+             "📈 *Trading Features:*\n"
+             "• Market Orders - Buy with USD or sell shares at the best available price\n"
+             "• Limit Orders - Set your desired price for buying or selling\n"
+             "• Order History - Track all your trades and their status\n"
+             "• Market History - View all trades for any market",
         parse_mode='Markdown'
     )
 
@@ -232,6 +262,9 @@ async def setup_commands(application):
         BotCommand("start", "Start the bot and show menu"),
         BotCommand("subscribe", "Subscribe to market alerts"),
         BotCommand("unsubscribe", "Unsubscribe from alerts"),
+        BotCommand("orders", "View your order history"),
+        BotCommand("market_orders", "View orders for a specific market"),
+        BotCommand("status", "Check connection status of services"),
         BotCommand("help", "Show help information")
     ]
 
@@ -388,6 +421,90 @@ async def handle_price_entry(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return ENTERING_PRICE
 
+async def orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show user's order history"""
+    try:
+        user_id = update.effective_user.id
+        orders = mongo_handler.get_user_orders(user_id)
+
+        if not orders:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="You haven't placed any orders yet."
+            )
+            return
+
+        message = "📜 Your Order History:\n\n"
+        for order in orders:
+            message += (
+                f"🔹 {order['type'].title()} {order['side']} Order\n"
+                f"Market: {order['market_id']}\n"
+                f"Outcome: {order['outcome']}\n"
+                f"Amount: {'$' if order['side'] == 'BUY' else ''}{order['amount']}\n"
+            )
+            if order['type'] == 'limit':
+                message += f"Price: ${order['price']}\n"
+            message += f"Status: {order['status'].title()}\n"
+            if order.get('error_message'):
+                message += f"Error: {order['error_message']}\n"
+            message += f"Date: {order['created_at'].strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=message
+        )
+
+    except Exception as e:
+        logger.error(f"Error fetching order history: {e}")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="An error occurred while fetching your order history."
+        )
+
+async def market_orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show orders for a specific market"""
+    try:
+        if not context.args or len(context.args) != 1:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Please provide a market ID. Usage: /market_orders <market_id>"
+            )
+            return
+
+        market_id = context.args[0]
+        orders = mongo_handler.get_market_orders(market_id)
+
+        if not orders:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"No orders found for market {market_id}."
+            )
+            return
+
+        message = f"📊 Orders for Market {market_id}:\n\n"
+        for order in orders:
+            message += (
+                f"🔹 {order['type'].title()} {order['side']} Order\n"
+                f"Outcome: {order['outcome']}\n"
+                f"Amount: {'$' if order['side'] == 'BUY' else ''}{order['amount']}\n"
+            )
+            if order['type'] == 'limit':
+                message += f"Price: ${order['price']}\n"
+            message += f"Status: {order['status'].title()}\n"
+            message += f"Date: {order['created_at'].strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=message
+        )
+
+    except Exception as e:
+        logger.error(f"Error fetching market orders: {e}")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="An error occurred while fetching market orders."
+        )
+
 async def place_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Place the actual order using Polymarket CLOB API"""
     try:
@@ -439,7 +556,8 @@ async def place_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
 
         # Save order to MongoDB
-        orders_collection.insert_one(order_data)
+        if not mongo_handler.save_order(order_data):
+            logger.error("Failed to save order to MongoDB")
 
         # Send response to user
         if resp.get("success"):
@@ -469,6 +587,48 @@ async def place_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Clear user data
     context.user_data.clear()
 
+async def check_connection_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check the connection status of MongoDB and other services"""
+    try:
+        # Check MongoDB connection
+        mongo_handler.client.admin.command('ping')
+        mongo_status = "✅ Connected"
+    except Exception as e:
+        mongo_status = f"❌ Disconnected ({str(e)})"
+
+    # Check CLOB client (basic check)
+    try:
+        # Just check if the client is initialized
+        if clob_client:
+            clob_status = "✅ Initialized"
+        else:
+            clob_status = "❌ Not initialized"
+    except Exception as e:
+        clob_status = f"❌ Error ({str(e)})"
+
+    message = (
+        "🔧 *Service Status*\n\n"
+        f"📦 MongoDB: {mongo_status}\n"
+        f"🔄 CLOB Client: {clob_status}\n"
+    )
+
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=message,
+        parse_mode='Markdown'
+    )
+
+async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel the current order process"""
+    message = "Order process cancelled."
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(message)
+    else:
+        await update.message.reply_text(message)
+    context.user_data.clear()
+    return ConversationHandler.END
+
 if __name__ == '__main__':
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
@@ -486,12 +646,29 @@ if __name__ == '__main__':
             CallbackQueryHandler(handle_limit_order, pattern=r'^limit_order:')
         ],
         states={
-            SELECTING_OUTCOME: [CallbackQueryHandler(handle_outcome_selection, pattern=r'^outcome:')],
-            SELECTING_SIDE: [CallbackQueryHandler(handle_side_selection, pattern=r'^side:')],
-            ENTERING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_amount_entry)],
-            ENTERING_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_price_entry)]
+            SELECTING_OUTCOME: [
+                CallbackQueryHandler(handle_outcome_selection, pattern=r'^outcome:'),
+                CallbackQueryHandler(cancel_order, pattern=r'^cancel$')
+            ],
+            SELECTING_SIDE: [
+                CallbackQueryHandler(handle_side_selection, pattern=r'^side:'),
+                CallbackQueryHandler(cancel_order, pattern=r'^cancel$')
+            ],
+            ENTERING_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_amount_entry),
+                CommandHandler('cancel', cancel_order)
+            ],
+            ENTERING_PRICE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_price_entry),
+                CommandHandler('cancel', cancel_order)
+            ]
         },
-        fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)]
+        fallbacks=[
+            CommandHandler('cancel', cancel_order),
+            CallbackQueryHandler(cancel_order, pattern=r'^cancel$')
+        ],
+        per_chat=True,     # Allow multiple conversations per chat
+        per_user=True      # Track conversations per user
     )
 
     # Add handlers
@@ -499,6 +676,9 @@ if __name__ == '__main__':
     subscribe_handler = CommandHandler('subscribe', subscribe)
     unsubscribe_handler = CommandHandler('unsubscribe', unsubscribe)
     help_handler = CommandHandler('help', help_command)
+    orders_handler = CommandHandler('orders', orders_command)
+    market_orders_handler = CommandHandler('market_orders', market_orders_command)
+    status_handler = CommandHandler('status', check_connection_status)
     message_handler = MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     unknown_handler = MessageHandler(filters.COMMAND, unknown)
 
@@ -507,6 +687,9 @@ if __name__ == '__main__':
     application.add_handler(subscribe_handler)
     application.add_handler(unsubscribe_handler)
     application.add_handler(help_handler)
+    application.add_handler(orders_handler)
+    application.add_handler(market_orders_handler)
+    application.add_handler(status_handler)
     application.add_handler(message_handler)
     application.add_handler(unknown_handler)
 
