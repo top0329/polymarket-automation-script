@@ -9,7 +9,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, BotCommand, Me
 from telegram.ext import filters, ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, ConversationHandler
 from warnings import filterwarnings
 from telegram.warnings import PTBUserWarning
-from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType
+from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType, ApiCreds
 from py_clob_client.order_builder.constants import BUY, SELL
 from py_clob_client.client import ClobClient
 from models import MongoDBHandler
@@ -32,7 +32,12 @@ def init_services():
 
         # Initialize CLOB client
         logger.info("Initializing CLOB client...")
-        clob_client = ClobClient(CLOB_HTTP_URL, key=PRIVATE_KEY, chain_id=CHAIN_ID)
+        creds = ApiCreds(
+            api_key=os.getenv("CLOB_API_KEY"),
+            api_secret=os.getenv("CLOB_SECRET"),
+            api_passphrase=os.getenv("CLOB_PASS_PHRASE"),
+        )
+        clob_client = ClobClient(CLOB_HTTP_URL, key=PRIVATE_KEY, chain_id=CHAIN_ID, creds=creds, signature_type=2, funder=os.getenv("POLYMARKET_PROXY_ADDRESS"))
         logger.info("✅ CLOB client initialized successfully!")
 
         return mongo_handler, clob_client
@@ -290,17 +295,27 @@ async def handle_market_order(update: Update, context: ContextTypes.DEFAULT_TYPE
         response = requests.get(f"{GAMMA_ENDPOINT}/markets/{market_id}")
         market_data = response.json()
         outcomes = json.loads(market_data['outcomes'])
-        token_ids = json.loads(market_data.get('tokenIds', '[]'))
+        token_ids = json.loads(market_data.get('clobTokenIds', '[]'))
 
         # Store token IDs mapped to outcomes
         context.user_data['token_ids'] = dict(zip(outcomes, token_ids))
 
-        # Create outcome selection buttons
-        keyboard = [[InlineKeyboardButton(outcome, callback_data=f"outcome:{outcome}")]
-                   for outcome in outcomes]
+        # Create outcome selection buttons with back/cancel
+        keyboard = []
+        for outcome in outcomes:
+            keyboard.append([InlineKeyboardButton(outcome, callback_data=f"outcome:{outcome}")])
+
+        # Add back and cancel buttons
+        keyboard.append([
+            InlineKeyboardButton("🔙 Back", callback_data="back"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel")
+        ])
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        await query.edit_message_text(
+        # Send new message instead of editing
+        await query.answer()
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
             text="Select the outcome you want to trade:",
             reply_markup=reply_markup
         )
@@ -325,17 +340,27 @@ async def handle_limit_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
         response = requests.get(f"{GAMMA_ENDPOINT}/markets/{market_id}")
         market_data = response.json()
         outcomes = json.loads(market_data['outcomes'])
-        token_ids = json.loads(market_data.get('tokenIds', '[]'))
+        token_ids = json.loads(market_data.get('clobTokenIds', '[]'))
 
         # Store token IDs mapped to outcomes
         context.user_data['token_ids'] = dict(zip(outcomes, token_ids))
 
-        # Create outcome selection buttons
-        keyboard = [[InlineKeyboardButton(outcome, callback_data=f"outcome:{outcome}")]
-                   for outcome in outcomes]
+        # Create outcome selection buttons with back/cancel
+        keyboard = []
+        for outcome in outcomes:
+            keyboard.append([InlineKeyboardButton(outcome, callback_data=f"outcome:{outcome}")])
+
+        # Add back and cancel buttons
+        keyboard.append([
+            InlineKeyboardButton("🔙 Back", callback_data="back"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel")
+        ])
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        await query.edit_message_text(
+        # Send new message instead of editing
+        await query.answer()
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
             text="Select the outcome you want to trade:",
             reply_markup=reply_markup
         )
@@ -349,33 +374,141 @@ async def handle_limit_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def handle_outcome_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle outcome selection"""
     query = update.callback_query
+
+    # Handle back button
+    if query.data == "back":
+        # Clear the current selection
+        context.user_data.clear()
+        await query.answer("Going back...")
+        # Delete the current message
+        await query.message.delete()
+        return ConversationHandler.END
+
+    # Handle cancel button
+    if query.data == "cancel":
+        await query.message.delete()
+        await cancel_order(update, context)
+        return ConversationHandler.END
+
     outcome = query.data.split(':')[1]
-    context.user_data['selected_outcome'] = outcome
-    context.user_data['token_id'] = context.user_data['token_ids'][outcome]
 
-    # Create side selection buttons
-    keyboard = [
-        [
-            InlineKeyboardButton("Buy", callback_data="side:buy"),
-            InlineKeyboardButton("Sell", callback_data="side:sell")
+    # Log the available data for debugging
+    logger.info(f"Selected outcome: {outcome}")
+    logger.info(f"Available token_ids in context: {context.user_data.get('token_ids', {})}")
+
+    try:
+        # Store selected outcome
+        context.user_data['selected_outcome'] = outcome
+
+        # Get and store token ID with better error handling
+        token_ids = context.user_data.get('token_ids', {})
+        if not token_ids:
+            logger.error("No token IDs found in context data")
+            await query.answer("Error: Market data not found. Please try again.")
+            return ConversationHandler.END
+
+        if outcome not in token_ids:
+            logger.error(f"Token ID not found for outcome: {outcome}")
+            await query.answer("Error: Invalid outcome selected. Please try again.")
+            return ConversationHandler.END
+
+        context.user_data['token_id'] = token_ids[outcome]
+        logger.info(f"Successfully mapped outcome {outcome} to token ID {token_ids[outcome]}")
+
+        # Delete the outcome selection message
+        await query.message.delete()
+
+        # Create side selection buttons with back/cancel
+        keyboard = [
+            [
+                InlineKeyboardButton("Buy", callback_data="side:buy"),
+                InlineKeyboardButton("Sell", callback_data="side:sell")
+            ],
+            [
+                InlineKeyboardButton("🔙 Back", callback_data="back"),
+                InlineKeyboardButton("❌ Cancel", callback_data="cancel")
+            ]
         ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+        reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await query.edit_message_text(
-        text=f"Selected outcome: {outcome}\nDo you want to buy or sell?",
-        reply_markup=reply_markup
-    )
-    return SELECTING_SIDE
+        # Send new message instead of editing
+        await query.answer()
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"Selected outcome: {outcome}\nDo you want to buy or sell?",
+            reply_markup=reply_markup
+        )
+        return SELECTING_SIDE
+
+    except Exception as e:
+        logger.error(f"Error in handle_outcome_selection: {str(e)}")
+        await query.answer("An error occurred. Please try again.")
+        return ConversationHandler.END
 
 async def handle_side_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle side selection"""
     query = update.callback_query
+
+    # Handle back button
+    if query.data == "back":
+        # Go back to outcome selection
+        keyboard = []
+        for outcome in context.user_data.get('token_ids', {}).keys():
+            keyboard.append([InlineKeyboardButton(outcome, callback_data=f"outcome:{outcome}")])
+        keyboard.append([
+            InlineKeyboardButton("🔙 Back", callback_data="back"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel")
+        ])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        # Delete the current message
+        await query.message.delete()
+
+        await query.answer("Going back...")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Select the outcome you want to trade:",
+            reply_markup=reply_markup
+        )
+        return SELECTING_OUTCOME
+
+    # Handle cancel button
+    if query.data == "cancel":
+        await query.message.delete()
+        await cancel_order(update, context)
+        return ConversationHandler.END
+
     side = query.data.split(':')[1]
     context.user_data['side'] = BUY if side.lower() == 'buy' else SELL
 
-    await query.edit_message_text(
-        text=f"Enter the amount you want to trade (in {'USD' if context.user_data['side'] == BUY else 'shares'}):"
+    # Delete the side selection message
+    await query.message.delete()
+
+    # Provide detailed instructions based on order side
+    if context.user_data['side'] == BUY:
+        message = (
+            "Enter the amount in USD you want to spend.\n\n"
+            "📝 Guidelines:\n"
+            "• Minimum: $1\n"
+            "• Format: Decimal number (e.g., 10.5)\n"
+            "• The amount will be used to buy position tokens at the current market price\n\n"
+            "Type /cancel to cancel the order"
+        )
+    else:
+        message = (
+            "Enter the number of shares (position tokens) you want to sell.\n\n"
+            "📝 Guidelines:\n"
+            "• Format: Decimal number (e.g., 5.0)\n"
+            "• You can only sell shares you own\n"
+            "• Each share represents one position token\n\n"
+            "Type /cancel to cancel the order"
+        )
+
+    # Send new message instead of editing
+    await query.answer()
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=message
     )
     return ENTERING_AMOUNT
 
@@ -383,21 +516,54 @@ async def handle_amount_entry(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Handle amount entry"""
     try:
         amount = float(update.message.text)
+
+        # Validate amount based on order side
+        if context.user_data['side'] == BUY:
+            if amount < 1.0:
+                await update.message.reply_text(
+                    "❌ Minimum order amount is $1.00. Please enter a larger amount:"
+                )
+                return ENTERING_AMOUNT
+        else:
+            if amount <= 0:
+                await update.message.reply_text(
+                    "❌ Please enter a positive number of shares to sell:"
+                )
+                return ENTERING_AMOUNT
+
         context.user_data['amount'] = amount
 
         if context.user_data['order_type'] == 'market':
+            # Show confirmation message before placing market order
+            side_text = "buy" if context.user_data['side'] == BUY else "sell"
+            amount_text = f"${amount:.2f}" if context.user_data['side'] == BUY else f"{amount:.2f} shares"
+
+            message = (
+                f"📋 Order Summary:\n"
+                f"Type: Market Order\n"
+                f"Action: {side_text.upper()}\n"
+                f"Amount: {amount_text}\n"
+                f"Outcome: {context.user_data['selected_outcome']}\n\n"
+                f"⚠️ Market orders are executed immediately at the best available price."
+            )
+
             # Place market order
             await place_order(update, context)
             return ConversationHandler.END
         else:
+            # For limit orders, proceed to price entry
             await update.message.reply_text(
-                "Enter the limit price (between 0 and 1):"
+                "Enter the limit price (between 0 and 1):\n\n"
+                "📝 Guidelines:\n"
+                "• Price must be between 0 and 1\n"
+                "• Example: 0.75 means $0.75 per share\n"
+                "• The order will only execute when the market price matches your limit price"
             )
             return ENTERING_PRICE
 
     except ValueError:
         await update.message.reply_text(
-            "Please enter a valid number for the amount."
+            "❌ Please enter a valid number (e.g., 10.5):"
         )
         return ENTERING_AMOUNT
 
@@ -511,6 +677,10 @@ async def place_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         token_id = context.user_data['token_id']
         amount = context.user_data['amount']
         side = context.user_data['side']
+        order_type = context.user_data['order_type']
+
+        # Log order attempt
+        logger.info(f"Attempting to place {order_type} order: {side} {amount} of token {token_id}")
 
         order_data = {
             "user_id": update.effective_user.id,
@@ -519,33 +689,104 @@ async def place_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "token_id": token_id,
             "amount": amount,
             "side": "BUY" if side == BUY else "SELL",
-            "type": context.user_data['order_type'],
+            "type": order_type,
             "status": "pending",
             "created_at": datetime.now(timezone.utc),
         }
 
-        if context.user_data['order_type'] == 'limit':
-            price = context.user_data['price']
-            order_data['price'] = price
+        try:
+            if order_type == 'limit':
+                price = context.user_data['price']
+                order_data['price'] = price
 
-            # Create and sign a limit order
-            order_args = OrderArgs(
-                price=price,
-                size=amount,
-                side=side,
-                token_id=token_id
-            )
-            signed_order = clob_client.create_order(order_args)
-            resp = clob_client.post_order(signed_order, OrderType.GTC)
-        else:
-            # Create and sign a market order
-            order_args = MarketOrderArgs(
-                token_id=token_id,
-                amount=amount,
-                side=side
-            )
-            signed_order = clob_client.create_market_order(order_args)
-            resp = clob_client.post_order(signed_order, OrderType.FOK)
+                # Create and sign a limit order
+                order_args = OrderArgs(
+                    price=price,
+                    size=amount,
+                    side=side,
+                    token_id=token_id
+                )
+                signed_order = clob_client.create_order(order_args)
+                resp = clob_client.post_order(signed_order, OrderType.GTC)
+            else:
+                # Create and sign a market order
+                order_args = MarketOrderArgs(
+                    token_id=token_id,
+                    amount=amount,
+                    side=side
+                )
+                signed_order = clob_client.create_market_order(order_args)
+                resp = clob_client.post_order(signed_order, OrderType.FOK)
+
+            # Log API response
+            logger.info(f"CLOB API Response: {resp}")
+
+        except Exception as api_error:
+            error_message = str(api_error).lower()
+            logger.error(f"CLOB API Error: {error_message}")
+
+            # Handle specific error cases
+            if "no match" in error_message:
+                user_message = (
+                    "❌ Order failed: No matching orders found\n\n"
+                    "This can happen when:\n"
+                    "• For market orders: There isn't enough liquidity\n"
+                    "• For limit orders: No matching price available\n\n"
+                    "Try:\n"
+                    "• For market orders: Reduce your order size\n"
+                    "• For limit orders: Adjust your price"
+                )
+            elif "not enough balance" in error_message or "insufficient balance" in error_message:
+                if side == BUY:
+                    user_message = (
+                        "❌ Order failed: Insufficient USDC balance\n\n"
+                        "To place a buy order, you need:\n"
+                        "1. Sufficient USDC in your wallet\n"
+                        "2. USDC approved for trading on Polymarket\n\n"
+                        "Steps to resolve:\n"
+                        "1. Check your USDC balance\n"
+                        "2. Add more USDC if needed\n"
+                        "3. Approve USDC for trading on Polymarket"
+                    )
+                else:
+                    user_message = (
+                        "❌ Order failed: Insufficient position tokens\n\n"
+                        "To sell position tokens, you need:\n"
+                        "1. Sufficient tokens in your wallet\n"
+                        "2. Tokens approved for trading\n\n"
+                        "Please check your position token balance and approvals"
+                    )
+            elif "allowance" in error_message:
+                if side == BUY:
+                    user_message = (
+                        "❌ Order failed: USDC not approved for trading\n\n"
+                        "To trade on Polymarket, you need to:\n"
+                        "1. Visit polymarket.com\n"
+                        "2. Connect your wallet\n"
+                        "3. Approve USDC for trading"
+                    )
+                else:
+                    user_message = (
+                        "❌ Order failed: Position tokens not approved\n\n"
+                        "To sell position tokens, you need to:\n"
+                        "1. Visit polymarket.com\n"
+                        "2. Connect your wallet\n"
+                        "3. Approve position tokens for trading"
+                    )
+            elif "minimum order size" in error_message:
+                user_message = "❌ Order failed: Order size is below the minimum required"
+            else:
+                user_message = f"❌ Order failed: {error_message}"
+
+            await update.message.reply_text(user_message)
+            order_data.update({
+                "status": "failed",
+                "error_message": error_message
+            })
+            # Save failed order to MongoDB
+            mongo_handler.save_order(order_data)
+            context.user_data.clear()
+            return
 
         # Update order data with response
         order_data.update({
@@ -562,26 +803,32 @@ async def place_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Send response to user
         if resp.get("success"):
             message = (
-                f"Order placed successfully!\n"
-                f"Type: {order_data['type'].title()} Order\n"
-                f"Side: {order_data['side']}\n"
-                f"Outcome: {order_data['outcome']}\n"
-                f"Amount: {'$' if order_data['side'] == 'BUY' else ''}{order_data['amount']}"
+                "✅ Order placed successfully!\n\n"
+                f"📋 Order Details:\n"
+                f"• Type: {order_data['type'].title()} Order\n"
+                f"• Side: {order_data['side']}\n"
+                f"• Outcome: {order_data['outcome']}\n"
+                f"• Amount: {'$' if order_data['side'] == 'BUY' else ''}{order_data['amount']}"
             )
             if order_data['type'] == 'limit':
-                message += f"\nPrice: ${order_data['price']}"
+                message += f"\n• Price: ${order_data['price']}"
+
+            if order_data.get("transaction_hashes"):
+                message += f"\n\n🔗 Transaction Hash: {order_data['transaction_hashes'][0]}"
 
             await update.message.reply_text(message)
         else:
             error_msg = resp.get("errorMsg", "Unknown error")
             await update.message.reply_text(
-                f"Failed to place order: {error_msg}\nPlease try again later."
+                f"❌ Order failed: {error_msg}\n\n"
+                "Please check your order details and try again."
             )
 
     except Exception as e:
-        logger.error(f"Error placing order: {e}")
+        logger.error(f"Error placing order: {str(e)}")
         await update.message.reply_text(
-            "An error occurred while placing your order. Please try again later."
+            "❌ An unexpected error occurred while placing your order.\n"
+            "Please try again later or contact support if the issue persists."
         )
 
     # Clear user data
@@ -648,10 +895,12 @@ if __name__ == '__main__':
         states={
             SELECTING_OUTCOME: [
                 CallbackQueryHandler(handle_outcome_selection, pattern=r'^outcome:'),
+                CallbackQueryHandler(handle_outcome_selection, pattern=r'^back$'),
                 CallbackQueryHandler(cancel_order, pattern=r'^cancel$')
             ],
             SELECTING_SIDE: [
                 CallbackQueryHandler(handle_side_selection, pattern=r'^side:'),
+                CallbackQueryHandler(handle_side_selection, pattern=r'^back$'),
                 CallbackQueryHandler(cancel_order, pattern=r'^cancel$')
             ],
             ENTERING_AMOUNT: [
