@@ -67,7 +67,7 @@ except Exception as e:
     raise SystemExit(1)
 
 # States for order conversation
-SELECTING_OUTCOME, ENTERING_AMOUNT, ENTERING_PRICE, SELECTING_SIDE = range(4)
+SELECTING_OUTCOME, ENTERING_AMOUNT, ENTERING_PRICE, SELECTING_SIDE, CONFIRMING_ORDER = range(5)
 
 # Global variables
 subscribed_chats = set()
@@ -547,9 +547,17 @@ async def handle_amount_entry(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"⚠️ Market orders are executed immediately at the best available price."
             )
 
-            # Place market order
-            await place_order(update, context)
-            return ConversationHandler.END
+            # Create confirm/cancel buttons
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Confirm Order", callback_data="confirm_order"),
+                    InlineKeyboardButton("❌ Cancel", callback_data="cancel")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.message.reply_text(message, reply_markup=reply_markup)
+            return CONFIRMING_ORDER
         else:
             # For limit orders, proceed to price entry
             await update.message.reply_text(
@@ -573,8 +581,32 @@ async def handle_price_entry(update: Update, context: ContextTypes.DEFAULT_TYPE)
         price = float(update.message.text)
         if 0 <= price <= 1:
             context.user_data['price'] = price
-            await place_order(update, context)
-            return ConversationHandler.END
+
+            # Show confirmation message
+            side_text = "buy" if context.user_data['side'] == BUY else "sell"
+            amount_text = f"${context.user_data['amount']:.2f}" if context.user_data['side'] == BUY else f"{context.user_data['amount']:.2f} shares"
+
+            message = (
+                f"📋 Order Summary:\n"
+                f"Type: Limit Order\n"
+                f"Action: {side_text.upper()}\n"
+                f"Amount: {amount_text}\n"
+                f"Price: ${price:.2f}\n"
+                f"Outcome: {context.user_data['selected_outcome']}\n\n"
+                f"⚠️ Limit orders are executed when the market price matches your limit price."
+            )
+
+            # Create confirm/cancel buttons
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Confirm Order", callback_data="confirm_order"),
+                    InlineKeyboardButton("❌ Cancel", callback_data="cancel")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.message.reply_text(message, reply_markup=reply_markup)
+            return CONFIRMING_ORDER
         else:
             await update.message.reply_text(
                 "Price must be between 0 and 1. Please try again:"
@@ -586,6 +618,20 @@ async def handle_price_entry(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "Please enter a valid number for the price."
         )
         return ENTERING_PRICE
+
+async def handle_order_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle order confirmation"""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "confirm_order":
+        # Place the order
+        await place_order(update, context)
+        return ConversationHandler.END
+    elif query.data == "cancel":
+        await query.message.edit_text("Order cancelled.")
+        context.user_data.clear()
+        return ConversationHandler.END
 
 async def orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show user's order history"""
@@ -721,87 +767,65 @@ async def place_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Log API response
             logger.info(f"CLOB API Response: {resp}")
 
-        except Exception as api_error:
-            error_message = str(api_error).lower()
-            logger.error(f"CLOB API Error: {error_message}")
+            # Handle response based on success and errorMsg
+            if not resp.get("success"):
+                # Server-side error
+                error_message = resp.get("errorMsg", "Unknown server error")
+                user_message = get_error_message(error_message, side)
 
-            # Handle specific error cases
-            if "no match" in error_message:
-                user_message = (
-                    "❌ Order failed: No matching orders found\n\n"
-                    "This can happen when:\n"
-                    "• For market orders: There isn't enough liquidity\n"
-                    "• For limit orders: No matching price available\n\n"
-                    "Try:\n"
-                    "• For market orders: Reduce your order size\n"
-                    "• For limit orders: Adjust your price"
-                )
-            elif "not enough balance" in error_message or "insufficient balance" in error_message:
-                if side == BUY:
-                    user_message = (
-                        "❌ Order failed: Insufficient USDC balance\n\n"
-                        "To place a buy order, you need:\n"
-                        "1. Sufficient USDC in your wallet\n"
-                        "2. USDC approved for trading on Polymarket\n\n"
-                        "Steps to resolve:\n"
-                        "1. Check your USDC balance\n"
-                        "2. Add more USDC if needed\n"
-                        "3. Approve USDC for trading on Polymarket"
-                    )
+                # Send error message based on update type
+                if update.callback_query:
+                    await update.callback_query.message.edit_text(user_message)
                 else:
-                    user_message = (
-                        "❌ Order failed: Insufficient position tokens\n\n"
-                        "To sell position tokens, you need:\n"
-                        "1. Sufficient tokens in your wallet\n"
-                        "2. Tokens approved for trading\n\n"
-                        "Please check your position token balance and approvals"
-                    )
-            elif "allowance" in error_message:
-                if side == BUY:
-                    user_message = (
-                        "❌ Order failed: USDC not approved for trading\n\n"
-                        "To trade on Polymarket, you need to:\n"
-                        "1. Visit polymarket.com\n"
-                        "2. Connect your wallet\n"
-                        "3. Approve USDC for trading"
-                    )
-                else:
-                    user_message = (
-                        "❌ Order failed: Position tokens not approved\n\n"
-                        "To sell position tokens, you need to:\n"
-                        "1. Visit polymarket.com\n"
-                        "2. Connect your wallet\n"
-                        "3. Approve position tokens for trading"
-                    )
-            elif "minimum order size" in error_message:
-                user_message = "❌ Order failed: Order size is below the minimum required"
-            else:
-                user_message = f"❌ Order failed: {error_message}"
+                    await update.message.reply_text(user_message)
 
-            await update.message.reply_text(user_message)
+                order_data.update({
+                    "status": "failed",
+                    "error_message": error_message
+                })
+                mongo_handler.save_order(order_data)
+                context.user_data.clear()
+                return
+            elif resp.get("errorMsg"):  # success=True but has error message (client-side error)
+                # Handle delayed or warning cases
+                error_message = resp.get("errorMsg")
+                if "ORDER_DELAYED" in error_message or "MARKET_NOT_READY" in error_message:
+                    status = "pending"
+                    if "ORDER_DELAYED" in error_message:
+                        user_message = "⏳ Order is delayed due to market conditions. It will be processed when conditions improve."
+                    else:
+                        user_message = "⏳ Market is not ready to process orders yet. Your order will be processed when the market is ready."
+                else:
+                    status = "failed"
+                    user_message = get_error_message(error_message, side)
+
+                # Send message based on update type
+                if update.callback_query:
+                    await update.callback_query.message.edit_text(user_message)
+                else:
+                    await update.message.reply_text(user_message)
+
+                order_data.update({
+                    "status": status,
+                    "error_message": error_message
+                })
+                mongo_handler.save_order(order_data)
+                context.user_data.clear()
+                return
+
+            # If we get here, the order was successful
             order_data.update({
-                "status": "failed",
-                "error_message": error_message
+                "order_id": resp.get("orderID"),
+                "transaction_hashes": resp.get("transactionsHashes", []),
+                "status": resp.get("status", "success"),
+                "error_message": ""
             })
-            # Save failed order to MongoDB
-            mongo_handler.save_order(order_data)
-            context.user_data.clear()
-            return
 
-        # Update order data with response
-        order_data.update({
-            "order_id": resp.get("orderID"),
-            "transaction_hashes": resp.get("transactionsHashes", []),
-            "status": "success" if resp.get("success") else "failed",
-            "error_message": resp.get("errorMsg", "")
-        })
+            # Save successful order to MongoDB
+            if not mongo_handler.save_order(order_data):
+                logger.error("Failed to save order to MongoDB")
 
-        # Save order to MongoDB
-        if not mongo_handler.save_order(order_data):
-            logger.error("Failed to save order to MongoDB")
-
-        # Send response to user
-        if resp.get("success"):
+            # Prepare success message
             message = (
                 "✅ Order placed successfully!\n\n"
                 f"📋 Order Details:\n"
@@ -812,27 +836,145 @@ async def place_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             if order_data['type'] == 'limit':
                 message += f"\n• Price: ${order_data['price']}"
-
+            if order_data.get("status"):
+                message += f"\n• Status: {order_data['status'].title()}"
             if order_data.get("transaction_hashes"):
                 message += f"\n\n🔗 Transaction Hash: {order_data['transaction_hashes'][0]}"
 
-            await update.message.reply_text(message)
-        else:
-            error_msg = resp.get("errorMsg", "Unknown error")
-            await update.message.reply_text(
-                f"❌ Order failed: {error_msg}\n\n"
-                "Please check your order details and try again."
-            )
+            # Send success message based on update type
+            if update.callback_query:
+                await update.callback_query.message.edit_text(message)
+            else:
+                await update.message.reply_text(message)
+
+        except Exception as api_error:
+            error_message = str(api_error)
+            logger.error(f"CLOB API Error: {error_message}")
+
+            user_message = get_error_message(error_message, side)
+
+            # Send error message based on update type
+            if update.callback_query:
+                await update.callback_query.message.edit_text(user_message)
+            else:
+                await update.message.reply_text(user_message)
+
+            order_data.update({
+                "status": "failed",
+                "error_message": error_message
+            })
+            mongo_handler.save_order(order_data)
 
     except Exception as e:
         logger.error(f"Error placing order: {str(e)}")
-        await update.message.reply_text(
+        error_message = (
             "❌ An unexpected error occurred while placing your order.\n"
             "Please try again later or contact support if the issue persists."
         )
+        # Send error message based on update type
+        if update.callback_query:
+            await update.callback_query.message.edit_text(error_message)
+        else:
+            await update.message.reply_text(error_message)
 
     # Clear user data
     context.user_data.clear()
+
+def get_error_message(error_message: str, side: str) -> str:
+    """Get user-friendly error message based on the error message content"""
+    # Handle PolyApiException format
+    if "PolyApiException" in error_message:
+        try:
+            # Try to extract the error message from the error property
+            import ast
+            # Find the error_message dictionary in the exception string
+            start = error_message.find("{")
+            end = error_message.rfind("}")
+            if start != -1 and end != -1:
+                error_dict = ast.literal_eval(error_message[start:end+1])
+                error_message = error_dict.get('error', error_message)
+        except:
+            # If parsing fails, use the original message
+            pass
+
+    if "minimum tick size" in error_message.lower():
+        return "❌ Order failed: Price does not meet minimum tick size requirement."
+
+    elif "minimum" in error_message.lower() and "size" in error_message.lower():
+        return "❌ Order failed: Order size is below the minimum required amount."
+
+    elif "duplicated" in error_message.lower():
+        return "❌ Order failed: This exact order has already been placed."
+
+    elif "not enough balance" in error_message.lower() or "insufficient balance" in error_message.lower():
+        if side == BUY:
+            return (
+                "❌ Order failed: Insufficient USDC balance or allowance\n\n"
+                "To place a buy order, you need:\n"
+                "1. Sufficient USDC in your wallet\n"
+                "2. USDC approved for trading on Polymarket\n\n"
+                "Steps to resolve:\n"
+                "1. Check your USDC balance\n"
+                "2. Add more USDC if needed\n"
+                "3. Approve USDC for trading on Polymarket"
+            )
+        else:
+            return (
+                "❌ Order failed: Insufficient position tokens or allowance\n\n"
+                "To sell position tokens, you need:\n"
+                "1. Sufficient tokens in your wallet\n"
+                "2. Tokens approved for trading\n\n"
+                "Please check your position token balance and approvals"
+            )
+
+    elif "invalid signature" in error_message.lower():
+        return "❌ Order failed: Invalid signature. Please try again or contact support if the issue persists."
+
+    elif "expiration" in error_message.lower():
+        return "❌ Order failed: Order expiration time is invalid."
+
+    elif "could not insert" in error_message.lower():
+        return "❌ Order failed: System error while placing order. Please try again."
+
+    elif "execution" in error_message.lower():
+        return "❌ Order failed: System error while executing trade. Please try again."
+
+    elif "delayed" in error_message.lower():
+        return "❌ Order failed: System error while processing order. Please try again."
+
+    elif "couldn't be fully filled" in error_message.lower() or "fok" in error_message.lower():
+        return (
+            "❌ Order failed: Could not fill the entire order\n\n"
+            "This happens when there isn't enough liquidity to fill your entire order.\n"
+            "Try reducing your order size or using a limit order instead."
+        )
+
+    elif "market not ready" in error_message.lower():
+        return "⏳ Market is not ready to process orders yet. Your order will be processed when the market is ready."
+
+    elif "order delayed" in error_message.lower():
+        return "⏳ Order is delayed due to market conditions. It will be processed when conditions improve."
+
+    elif "allowance" in error_message.lower():
+        if side == BUY:
+            return (
+                "❌ Order failed: USDC not approved for trading\n\n"
+                "To trade on Polymarket, you need to:\n"
+                "1. Visit polymarket.com\n"
+                "2. Connect your wallet\n"
+                "3. Approve USDC for trading"
+            )
+        else:
+            return (
+                "❌ Order failed: Position tokens not approved\n\n"
+                "To sell position tokens, you need to:\n"
+                "1. Visit polymarket.com\n"
+                "2. Connect your wallet\n"
+                "3. Approve position tokens for trading"
+            )
+
+    # Generic error message for unknown errors
+    return f"❌ Order failed: {error_message}"
 
 async def check_connection_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Check the connection status of MongoDB and other services"""
@@ -910,6 +1052,10 @@ if __name__ == '__main__':
             ENTERING_PRICE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_price_entry),
                 CommandHandler('cancel', cancel_order)
+            ],
+            CONFIRMING_ORDER: [
+                CallbackQueryHandler(handle_order_confirmation, pattern=r'^confirm_order$'),
+                CallbackQueryHandler(cancel_order, pattern=r'^cancel$')
             ]
         },
         fallbacks=[
