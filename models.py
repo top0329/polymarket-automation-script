@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 from pymongo import MongoClient
 from bson import ObjectId
@@ -19,7 +19,7 @@ class OrderSchema:
             "side": str,  # "BUY" or "SELL"
             "type": str,  # "market" or "limit"
             "price": Optional[float],  # Required for limit orders
-            "status": str,  # "pending", "success", "failed"
+            "status": str,  # "pending", "success", "failed", "matched"
             "order_id": Optional[str],
             "transaction_hashes": List[str],
             "error_message": Optional[str],
@@ -29,17 +29,19 @@ class OrderSchema:
 
     def validate_order(self, order_data: dict) -> bool:
         """Validate order data against schema"""
-        required_fields = [
-            "user_id", "market_id", "outcome", "token_id",
-            "amount", "side", "type", "status", "created_at"
-        ]
-
-        # Check required fields
-        if not all(field in order_data for field in required_fields):
-            return False
-
-        # Validate field types
         try:
+            # Check required fields
+            required_fields = [
+                "user_id", "market_id", "outcome", "token_id",
+                "amount", "side", "type", "status", "created_at"
+            ]
+
+            # Check required fields exist
+            if not all(field in order_data for field in required_fields):
+                logger.error(f"Missing required fields. Required: {required_fields}, Got: {list(order_data.keys())}")
+                return False
+
+            # Validate field types
             assert isinstance(order_data["user_id"], int)
             assert isinstance(order_data["market_id"], str)
             assert isinstance(order_data["outcome"], str)
@@ -47,12 +49,16 @@ class OrderSchema:
             assert isinstance(order_data["amount"], (int, float))
             assert order_data["side"] in ["BUY", "SELL"]
             assert order_data["type"] in ["market", "limit"]
-            assert order_data["status"] in ["pending", "success", "failed"]
-            assert isinstance(order_data["created_at"], datetime)
+            assert order_data["status"] in ["pending", "success", "failed", "matched"]
+            assert isinstance(order_data["created_at"], (datetime, str))
+
+            # Convert string datetime to datetime object if needed
+            if isinstance(order_data["created_at"], str):
+                order_data["created_at"] = datetime.fromisoformat(order_data["created_at"].replace('Z', '+00:00'))
 
             # Validate price for limit orders
             if order_data["type"] == "limit":
-                assert isinstance(order_data["price"], (int, float))
+                assert isinstance(order_data.get("price"), (int, float))
                 assert 0 <= order_data["price"] <= 1
 
             # Validate optional fields if present
@@ -61,14 +67,23 @@ class OrderSchema:
                 assert all(isinstance(hash, str) for hash in order_data["transaction_hashes"])
 
             if "updated_at" in order_data:
-                assert isinstance(order_data["updated_at"], datetime)
+                assert isinstance(order_data["updated_at"], (datetime, str))
+                if isinstance(order_data["updated_at"], str):
+                    order_data["updated_at"] = datetime.fromisoformat(order_data["updated_at"].replace('Z', '+00:00'))
 
             if "error_message" in order_data:
                 assert isinstance(order_data["error_message"], str)
 
+            if "order_id" in order_data:
+                assert isinstance(order_data["order_id"], str)
+
             return True
 
-        except (AssertionError, KeyError):
+        except AssertionError as e:
+            logger.error(f"Validation error: {str(e)}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected validation error: {str(e)}")
             return False
 
 class MongoDBHandler:
@@ -81,8 +96,9 @@ class MongoDBHandler:
             self.client.admin.command('ping')
             logger.info("✅ Successfully connected to MongoDB!")
 
-            self.db = self.client.polymarket
+            self.db = self.client.polymarket_bot
             self.orders = self.db.orders
+            self.liquidity_monitoring = self.db.liquidity_monitoring
             self.order_schema = OrderSchema()
 
             # Create indexes
@@ -100,7 +116,12 @@ class MongoDBHandler:
             self.orders.create_index([("market_id", 1)])
             self.orders.create_index([("created_at", -1)])
             self.orders.create_index([("status", 1)])
-            logger.debug("Created MongoDB indexes for orders collection")
+
+            # Remove unique constraint from market_id to allow multiple subscriptions
+            self.liquidity_monitoring.create_index([("market_id", 1)])
+            self.liquidity_monitoring.create_index([("created_at", -1)])
+
+            logger.debug("Created MongoDB indexes for collections")
         except Exception as e:
             logger.error(f"Failed to create MongoDB indexes: {str(e)}")
             raise
@@ -170,3 +191,42 @@ class MongoDBHandler:
         except Exception as e:
             logger.error(f"Failed to fetch market orders: {str(e)}")
             return []
+
+    def save_liquidity_monitor(self, market_id: str, outcome: str, chat_id: int) -> bool:
+        """Save a liquidity monitor request"""
+        try:
+            result = self.liquidity_monitoring.update_one(
+                {"market_id": market_id, "chat_id": chat_id},
+                {
+                    "$set": {
+                        "outcome": outcome,
+                        "created_at": datetime.now(timezone.utc)
+                    }
+                },
+                upsert=True
+            )
+            return bool(result.acknowledged)
+        except Exception as e:
+            logger.error(f"Error saving liquidity monitor: {e}")
+            return False
+
+    def get_markets_awaiting_liquidity(self):
+        """Get all markets awaiting liquidity"""
+        try:
+            return list(self.liquidity_monitoring.find())
+        except Exception as e:
+            logger.error(f"Error getting markets awaiting liquidity: {e}")
+            return []
+
+    def remove_liquidity_monitor(self, market_id: str, chat_id: int = None) -> bool:
+        """Remove a liquidity monitor"""
+        try:
+            query = {"market_id": market_id}
+            if chat_id is not None:
+                query["chat_id"] = chat_id
+
+            result = self.liquidity_monitoring.delete_many(query)
+            return bool(result.deleted_count > 0)
+        except Exception as e:
+            logger.error(f"Error removing liquidity monitor: {e}")
+            return False

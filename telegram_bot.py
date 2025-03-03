@@ -74,6 +74,181 @@ subscribed_chats = set()
 previous_markets = None  # Store previous request's market data
 user_order_data = {}  # Store temporary order data
 
+def create_order_buttons(market_slug, market_id, market_data=None):
+    """Create order buttons with market data"""
+    logger.info(f"Creating order buttons for market {market_id}")
+    keyboard = [
+        [
+            InlineKeyboardButton("📈 Market Order", callback_data=f"market_order:{market_id}"),
+            InlineKeyboardButton("📊 Limit Order", callback_data=f"limit_order:{market_id}")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    logger.info(f"Created buttons with callback data: market_order:{market_id} and limit_order:{market_id}")
+    return reply_markup
+
+async def check_market_liquidity(context: ContextTypes.DEFAULT_TYPE):
+    """Check liquidity for markets being monitored and send alerts if liquidity is found"""
+    try:
+        # Get all markets from MongoDB
+        markets = mongo_handler.get_markets_awaiting_liquidity()
+        if not markets:
+            return
+
+        logger.info(f"Checking liquidity for {len(markets)} markets")
+
+        for market in markets:
+            try:
+                # Extract market data
+                market_id = market.get('market_id')
+                chat_id = market.get('chat_id')
+                selected_outcome = market.get('outcome')
+
+                if not all([market_id, chat_id, selected_outcome]):
+                    logger.error(f"Invalid market data in MongoDB: {market}")
+                    continue
+
+                # Fetch market data from Gamma API
+                try:
+                    response = requests.get(f"{GAMMA_ENDPOINT}/markets/{market_id}")
+                    response.raise_for_status()
+                    market_data = response.json()
+                except Exception as e:
+                    logger.error(f"Failed to fetch market data for {market_id}: {str(e)}")
+                    continue
+
+                # Check if market has liquidity
+                if not market_data.get('liquidity'):
+                    continue
+
+                logger.info(f"Liquidity found for market {market_id}")
+
+                try:
+                    # Prepare alert message
+                    message = (
+                        "🔄 Market Update: Liquidity Now Available!\n\n"
+                        f"Market: {market_data.get('question', 'Unknown Market')}\n"
+                        f"Selected Outcome: {selected_outcome}\n\n"
+                        "You can now place your order."
+                    )
+
+                    # Create order buttons
+                    reply_markup = create_order_buttons(
+                        market_data.get('slug', ''),
+                        market_id,
+                        market_data
+                    )
+
+                    # Send alert to user
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=message,
+                        reply_markup=reply_markup
+                    )
+
+                    # Remove market from monitoring
+                    if mongo_handler.remove_liquidity_monitor(market_id, chat_id):
+                        logger.info(f"Removed market {market_id} from liquidity monitoring")
+                    else:
+                        logger.error(f"Failed to remove market {market_id} from monitoring")
+
+                except Exception as e:
+                    logger.error(f"Error sending liquidity alert for market {market_id}: {str(e)}")
+                    continue
+
+            except Exception as e:
+                logger.error(f"Error processing market {market.get('market_id', 'unknown')}: {str(e)}")
+                continue
+
+    except Exception as e:
+        logger.error(f"Error in check_market_liquidity: {str(e)}")
+
+def subscribe_to_liquidity(market_id: str, outcome: str, chat_id: int) -> bool:
+    """Subscribe to liquidity updates for a specific market"""
+    try:
+        # Validate inputs
+        if not all([market_id, outcome, chat_id]):
+            logger.error("Missing required data for liquidity subscription")
+            return False
+
+        # Log subscription attempt
+        logger.info(f"Saving liquidity monitor - Market: {market_id}, Outcome: {outcome}, Chat: {chat_id}")
+
+        # Save to MongoDB
+        result = mongo_handler.save_liquidity_monitor(market_id, outcome, chat_id)
+
+        if result:
+            logger.info(f"Successfully saved liquidity monitor for market {market_id}")
+        else:
+            logger.error(f"Failed to save liquidity monitor for market {market_id}")
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Error in subscribe_to_liquidity: {e}")
+        return False
+
+async def handle_liquidity_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle user's response to liquidity subscription prompt"""
+    query = update.callback_query
+    await query.answer()
+
+    action, market_id = query.data.split(':')
+    chat_id = update.effective_chat.id
+
+    if action == "subscribe_liquidity":
+        # Get the selected outcome from context
+        selected_outcome = context.user_data.get('selected_outcome')
+
+        if not selected_outcome:
+            await query.message.edit_text(
+                "❌ Failed to subscribe: Missing outcome information. Please try placing the order again."
+            )
+            context.user_data.clear()
+            return
+
+        # Subscribe to liquidity updates
+        logger.info(f"Subscribing to liquidity updates - Market: {market_id}, Outcome: {selected_outcome}, Chat: {chat_id}")
+
+        if subscribe_to_liquidity(market_id, selected_outcome, chat_id):
+            await query.message.edit_text(
+                "✅ You'll be notified when liquidity becomes available for this market.\n"
+                "You can continue trading other markets in the meantime."
+            )
+            logger.info(f"Successfully subscribed to liquidity updates for market {market_id}")
+        else:
+            await query.message.edit_text(
+                "❌ Failed to subscribe to liquidity updates. Please try again later."
+            )
+            logger.error(f"Failed to subscribe to liquidity updates for market {market_id}")
+    else:
+        await query.message.edit_text(
+            "❌ Subscription cancelled. You can try again later or use a limit order instead."
+        )
+
+    # Clear user data after successful save or cancel
+    context.user_data.clear()
+
+async def show_liquidity_subscription_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, market_id: str):
+    """Show prompt to subscribe to liquidity updates"""
+    message = (
+        "❌ There are currently no opening orders for this market.\n\n"
+        "Would you like to be notified when liquidity becomes available?"
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Yes, notify me", callback_data=f"subscribe_liquidity:{market_id}"),
+            InlineKeyboardButton("❌ No, thanks", callback_data=f"cancel_liquidity:{market_id}")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if update.callback_query:
+        await update.callback_query.message.edit_text(message, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(message, reply_markup=reply_markup)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Create keyboard layout
     keyboard = [
@@ -167,15 +342,6 @@ def format_market_message(market):
 
     return message
 
-def create_order_buttons(market_slug, market_id):
-    keyboard = [
-        [
-            InlineKeyboardButton("📈 Market Order", callback_data=f"market_order:{market_id}"),
-            InlineKeyboardButton("📊 Limit Order", callback_data=f"limit_order:{market_id}")
-        ]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
 async def send_market_alert(context: ContextTypes.DEFAULT_TYPE, market):
     for chat_id in subscribed_chats:
         try:
@@ -208,40 +374,60 @@ async def check_new_markets(context: ContextTypes.DEFAULT_TYPE):
         }
 
         response = requests.get(os.path.join(GAMMA_ENDPOINT, "markets"), params=params)
-        response.raise_for_status()
+        response.raise_for_status()  # This will raise an exception for bad status codes
         current_markets = response.json()
 
+        # Validate that we received a list of markets
+        if not isinstance(current_markets, list):
+            logger.error(f"Unexpected market data format. Expected list, got: {type(current_markets)}")
+            return
+
         if not current_markets:
+            logger.info("No markets received from API")
             return
 
         # If this is the first request, store the data and return
         if previous_markets is None:
-            previous_markets = {market['id']: market for market in current_markets}
+            previous_markets = {market['id']: market for market in current_markets if 'id' in market}
+            logger.info(f"Initialized previous markets with {len(previous_markets)} markets")
             return
 
         # Convert current markets to dictionary for easier lookup
-        current_markets_dict = {market['id']: market for market in current_markets}
+        current_markets_dict = {market['id']: market for market in current_markets if 'id' in market}
 
         # Find new markets (present in current but not in previous)
         new_market_ids = set(current_markets_dict.keys()) - set(previous_markets.keys())
-        print(f"New market IDs: {new_market_ids}")
 
         if new_market_ids:
+            logger.info(f"Found {len(new_market_ids)} new markets")
             now = datetime.now(timezone.utc)
+
             # Check each new market
             for market_id in new_market_ids:
-                market = current_markets_dict[market_id]
-                start_date = datetime.fromisoformat(market['startDate'].replace('Z', '+00:00'))
+                try:
+                    market = current_markets_dict[market_id]
+                    if not market.get('startDate'):
+                        logger.warning(f"Market {market_id} has no startDate")
+                        continue
 
-                # Only alert for markets started in the last 2 minutes
-                if (now - start_date).total_seconds() <= 120:  # 2 minutes
-                    await send_market_alert(context, market)
+                    start_date = datetime.fromisoformat(market['startDate'].replace('Z', '+00:00'))
+
+                    # Only alert for markets started in the last 2 minutes
+                    if (now - start_date).total_seconds() <= 120:  # 2 minutes
+                        await send_market_alert(context, market)
+                        logger.info(f"Sent alert for new market {market_id}")
+                except Exception as market_error:
+                    logger.error(f"Error processing market {market_id}: {market_error}")
+                    continue
 
         # Update previous markets for next comparison
         previous_markets = current_markets_dict
 
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error making request to Gamma API: {e}")
     except Exception as e:
         logger.error(f"Error checking new markets: {e}")
+        # Don't update previous_markets if there was an error
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -284,23 +470,28 @@ async def setup_commands(application):
 async def handle_market_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle market order button click"""
     query = update.callback_query
-    market_id = query.data.split(':')[1]
+    await query.answer()  # Answer the callback query first
 
-    # Store market ID in user data
-    context.user_data['market_id'] = market_id
-    context.user_data['order_type'] = 'market'
-
-    # Get market outcomes
     try:
+        market_id = query.data.split(':')[1]
+        logger.info(f"Handling market order for market {market_id}")
+
+        # Store market ID in user data
+        context.user_data['market_id'] = market_id
+        context.user_data['order_type'] = 'market'
+
+        # Fetch market data from Gamma API
         response = requests.get(f"{GAMMA_ENDPOINT}/markets/{market_id}")
         market_data = response.json()
+
+        # Parse outcomes and token IDs
         outcomes = json.loads(market_data['outcomes'])
         token_ids = json.loads(market_data.get('clobTokenIds', '[]'))
 
         # Store token IDs mapped to outcomes
         context.user_data['token_ids'] = dict(zip(outcomes, token_ids))
 
-        # Create outcome selection buttons with back/cancel
+        # Create outcome selection buttons
         keyboard = []
         for outcome in outcomes:
             keyboard.append([InlineKeyboardButton(outcome, callback_data=f"outcome:{outcome}")])
@@ -312,8 +503,7 @@ async def handle_market_order(update: Update, context: ContextTypes.DEFAULT_TYPE
         ])
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        # Send new message instead of editing
-        await query.answer()
+        # Send new message instead of editing the original
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="Select the outcome you want to trade:",
@@ -322,30 +512,38 @@ async def handle_market_order(update: Update, context: ContextTypes.DEFAULT_TYPE
         return SELECTING_OUTCOME
 
     except Exception as e:
-        logger.error(f"Error fetching market data: {e}")
-        await query.answer("Error fetching market data. Please try again.")
+        logger.error(f"Error in handle_market_order: {str(e)}")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="❌ Error fetching market data. Please try again later."
+        )
         return ConversationHandler.END
 
 async def handle_limit_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle limit order button click"""
     query = update.callback_query
-    market_id = query.data.split(':')[1]
+    await query.answer()  # Answer the callback query first
 
-    # Store market ID in user data
-    context.user_data['market_id'] = market_id
-    context.user_data['order_type'] = 'limit'
-
-    # Get market outcomes
     try:
+        market_id = query.data.split(':')[1]
+        logger.info(f"Handling limit order for market {market_id}")
+
+        # Store market ID in user data
+        context.user_data['market_id'] = market_id
+        context.user_data['order_type'] = 'limit'
+
+        # Fetch market data from Gamma API
         response = requests.get(f"{GAMMA_ENDPOINT}/markets/{market_id}")
         market_data = response.json()
+
+        # Parse outcomes and token IDs
         outcomes = json.loads(market_data['outcomes'])
         token_ids = json.loads(market_data.get('clobTokenIds', '[]'))
 
         # Store token IDs mapped to outcomes
         context.user_data['token_ids'] = dict(zip(outcomes, token_ids))
 
-        # Create outcome selection buttons with back/cancel
+        # Create outcome selection buttons
         keyboard = []
         for outcome in outcomes:
             keyboard.append([InlineKeyboardButton(outcome, callback_data=f"outcome:{outcome}")])
@@ -357,8 +555,7 @@ async def handle_limit_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
         ])
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        # Send new message instead of editing
-        await query.answer()
+        # Send new message instead of editing the original
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="Select the outcome you want to trade:",
@@ -367,8 +564,11 @@ async def handle_limit_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return SELECTING_OUTCOME
 
     except Exception as e:
-        logger.error(f"Error fetching market data: {e}")
-        await query.answer("Error fetching market data. Please try again.")
+        logger.error(f"Error in handle_limit_order: {str(e)}")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="❌ Error fetching market data. Please try again later."
+        )
         return ConversationHandler.END
 
 async def handle_outcome_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -380,7 +580,7 @@ async def handle_outcome_selection(update: Update, context: ContextTypes.DEFAULT
         # Clear the current selection
         context.user_data.clear()
         await query.answer("Going back...")
-        # Delete the current message
+        # Delete only the outcome selection message
         await query.message.delete()
         return ConversationHandler.END
 
@@ -415,7 +615,7 @@ async def handle_outcome_selection(update: Update, context: ContextTypes.DEFAULT
         context.user_data['token_id'] = token_ids[outcome]
         logger.info(f"Successfully mapped outcome {outcome} to token ID {token_ids[outcome]}")
 
-        # Delete the outcome selection message
+        # Delete only the outcome selection message
         await query.message.delete()
 
         # Create side selection buttons with back/cancel
@@ -719,19 +919,19 @@ async def market_orders_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def place_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Place the actual order using Polymarket CLOB API"""
+    error_message = None
     try:
         token_id = context.user_data['token_id']
         amount = context.user_data['amount']
         side = context.user_data['side']
         order_type = context.user_data['order_type']
-
-        # Log order attempt
-        logger.info(f"Attempting to place {order_type} order: {side} {amount} of token {token_id}")
+        market_id = context.user_data['market_id']
+        selected_outcome = context.user_data['selected_outcome']
 
         order_data = {
             "user_id": update.effective_user.id,
-            "market_id": context.user_data['market_id'],
-            "outcome": context.user_data['selected_outcome'],
+            "market_id": market_id,
+            "outcome": selected_outcome,
             "token_id": token_id,
             "amount": amount,
             "side": "BUY" if side == BUY else "SELL",
@@ -744,6 +944,7 @@ async def place_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if order_type == 'limit':
                 price = context.user_data['price']
                 order_data['price'] = price
+                logger.info(f"Creating limit order with price {price}")
 
                 # Create and sign a limit order
                 order_args = OrderArgs(
@@ -755,6 +956,7 @@ async def place_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 signed_order = clob_client.create_order(order_args)
                 resp = clob_client.post_order(signed_order, OrderType.GTC)
             else:
+                logger.info("Creating market order")
                 # Create and sign a market order
                 order_args = MarketOrderArgs(
                     token_id=token_id,
@@ -771,46 +973,32 @@ async def place_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not resp.get("success"):
                 # Server-side error
                 error_message = resp.get("errorMsg", "Unknown server error")
-                user_message = get_error_message(error_message, side)
+                logger.error(f"Order failed with error: {error_message}")
 
-                # Send error message based on update type
-                if update.callback_query:
-                    await update.callback_query.message.edit_text(user_message)
+                # Check if it's a no match error
+                if "no match" in error_message.lower():
+                    # Keep the selected outcome in context before showing subscription prompt
+                    context.user_data.clear()  # Clear other data but keep what we need
+                    context.user_data['selected_outcome'] = selected_outcome  # Keep the outcome
+                    # Show subscription prompt
+                    await show_liquidity_subscription_prompt(update, context, market_id)
                 else:
-                    await update.message.reply_text(user_message)
+                    # Handle other errors
+                    user_message = get_error_message(error_message, side)
+                    if update.callback_query:
+                        await update.callback_query.message.edit_text(user_message)
+                    else:
+                        await update.message.reply_text(user_message)
 
                 order_data.update({
                     "status": "failed",
                     "error_message": error_message
                 })
-                mongo_handler.save_order(order_data)
-                context.user_data.clear()
-                return
-            elif resp.get("errorMsg"):  # success=True but has error message (client-side error)
-                # Handle delayed or warning cases
-                error_message = resp.get("errorMsg")
-                if "ORDER_DELAYED" in error_message or "MARKET_NOT_READY" in error_message:
-                    status = "pending"
-                    if "ORDER_DELAYED" in error_message:
-                        user_message = "⏳ Order is delayed due to market conditions. It will be processed when conditions improve."
-                    else:
-                        user_message = "⏳ Market is not ready to process orders yet. Your order will be processed when the market is ready."
-                else:
-                    status = "failed"
-                    user_message = get_error_message(error_message, side)
-
-                # Send message based on update type
-                if update.callback_query:
-                    await update.callback_query.message.edit_text(user_message)
-                else:
-                    await update.message.reply_text(user_message)
-
-                order_data.update({
-                    "status": status,
-                    "error_message": error_message
-                })
-                mongo_handler.save_order(order_data)
-                context.user_data.clear()
+                # Log order data before saving failed order
+                logger.info("Attempting to save failed order with data:")
+                logger.info(json.dumps(order_data, default=str))
+                save_result = mongo_handler.save_order(order_data)
+                logger.info(f"Failed order saved to MongoDB: {save_result}")
                 return
 
             # If we get here, the order was successful
@@ -821,9 +1009,19 @@ async def place_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "error_message": ""
             })
 
+            # Log order data before saving successful order
+            logger.info("Attempting to save successful order with data:")
+            logger.info(json.dumps(order_data, default=str))
+
             # Save successful order to MongoDB
-            if not mongo_handler.save_order(order_data):
-                logger.error("Failed to save order to MongoDB")
+            save_result = mongo_handler.save_order(order_data)
+            if not save_result:
+                logger.error("Failed to save successful order to MongoDB")
+                # Log validation result
+                validation_result = mongo_handler.order_schema.validate_order(order_data)
+                logger.error(f"Order validation result: {validation_result}")
+            else:
+                logger.info("Successfully saved order to MongoDB")
 
             # Prepare success message
             message = (
@@ -851,22 +1049,34 @@ async def place_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             error_message = str(api_error)
             logger.error(f"CLOB API Error: {error_message}")
 
-            user_message = get_error_message(error_message, side)
-
-            # Send error message based on update type
-            if update.callback_query:
-                await update.callback_query.message.edit_text(user_message)
+            # Check if it's a no match error
+            if "no match" in error_message.lower():
+                # Keep the selected outcome in context before showing subscription prompt
+                context.user_data.clear()  # Clear other data but keep what we need
+                context.user_data['selected_outcome'] = selected_outcome  # Keep the outcome
+                # Show subscription prompt
+                await show_liquidity_subscription_prompt(update, context, market_id)
             else:
-                await update.message.reply_text(user_message)
+                # Handle other errors
+                user_message = get_error_message(error_message, side)
+                if update.callback_query:
+                    await update.callback_query.message.edit_text(user_message)
+                else:
+                    await update.message.reply_text(user_message)
 
             order_data.update({
                 "status": "failed",
                 "error_message": error_message
             })
-            mongo_handler.save_order(order_data)
+            # Log order data before saving failed order from API error
+            logger.info("Attempting to save failed order (API error) with data:")
+            logger.info(json.dumps(order_data, default=str))
+            save_result = mongo_handler.save_order(order_data)
+            logger.info(f"Failed order saved to MongoDB: {save_result}")
 
     except Exception as e:
-        logger.error(f"Error placing order: {str(e)}")
+        error_message = str(e)
+        logger.error(f"Error placing order: {error_message}")
         error_message = (
             "❌ An unexpected error occurred while placing your order.\n"
             "Please try again later or contact support if the issue persists."
@@ -877,8 +1087,10 @@ async def place_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(error_message)
 
-    # Clear user data
-    context.user_data.clear()
+    finally:
+        # Only clear user data if we're not showing the subscription prompt
+        if error_message is None or not ("no match" in error_message.lower()):
+            context.user_data.clear()
 
 def get_error_message(error_message: str, side: str) -> str:
     """Get user-friendly error message based on the error message content"""
@@ -896,6 +1108,10 @@ def get_error_message(error_message: str, side: str) -> str:
         except:
             # If parsing fails, use the original message
             pass
+
+    # Check for no liquidity conditions
+    if "no match" in error_message.lower():
+        return "SHOW_SUBSCRIPTION_PROMPT"
 
     if "minimum tick size" in error_message.lower():
         return "❌ Order failed: Price does not meet minimum tick size requirement."
@@ -1026,22 +1242,25 @@ if __name__ == '__main__':
 
     # Add job queue to check for new markets every minute
     job_queue = application.job_queue
-    job_queue.run_repeating(check_new_markets, interval=10, first=10)
+    job_queue.run_repeating(check_new_markets, interval=60, first=10)
+
+    # Add job queue to monitor liquidity for subscribed markets every 10 seconds
+    job_queue.run_repeating(check_market_liquidity, interval=10, first=5)
 
     # Create conversation handler for orders
     order_handler = ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(handle_market_order, pattern=r'^market_order:'),
-            CallbackQueryHandler(handle_limit_order, pattern=r'^limit_order:')
+            CallbackQueryHandler(handle_market_order, pattern=r'^market_order:.*'),
+            CallbackQueryHandler(handle_limit_order, pattern=r'^limit_order:.*')
         ],
         states={
             SELECTING_OUTCOME: [
-                CallbackQueryHandler(handle_outcome_selection, pattern=r'^outcome:'),
+                CallbackQueryHandler(handle_outcome_selection, pattern=r'^outcome:.*'),
                 CallbackQueryHandler(handle_outcome_selection, pattern=r'^back$'),
                 CallbackQueryHandler(cancel_order, pattern=r'^cancel$')
             ],
             SELECTING_SIDE: [
-                CallbackQueryHandler(handle_side_selection, pattern=r'^side:'),
+                CallbackQueryHandler(handle_side_selection, pattern=r'^side:.*'),
                 CallbackQueryHandler(handle_side_selection, pattern=r'^back$'),
                 CallbackQueryHandler(cancel_order, pattern=r'^cancel$')
             ],
@@ -1063,7 +1282,8 @@ if __name__ == '__main__':
             CallbackQueryHandler(cancel_order, pattern=r'^cancel$')
         ],
         per_chat=True,     # Allow multiple conversations per chat
-        per_user=True      # Track conversations per user
+        per_user=True,     # Track conversations per user
+        allow_reentry=True # Allow users to start new conversations while one is active
     )
 
     # Add handlers
@@ -1077,7 +1297,14 @@ if __name__ == '__main__':
     message_handler = MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     unknown_handler = MessageHandler(filters.COMMAND, unknown)
 
+    # Add liquidity subscription handler
+    liquidity_handler = CallbackQueryHandler(
+        handle_liquidity_subscription,
+        pattern=r'^(subscribe|cancel)_liquidity:'
+    )
+
     application.add_handler(order_handler)  # Add this before other handlers
+    application.add_handler(liquidity_handler)  # Add liquidity handler
     application.add_handler(start_handler)
     application.add_handler(subscribe_handler)
     application.add_handler(unsubscribe_handler)
