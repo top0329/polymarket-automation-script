@@ -1,4 +1,4 @@
-# 🧭 Polymarket Automation Script [Project ID: P-334]
+# 🧭 Polymarket Automation Script
 
 Trade and monitor Polymarket prediction markets from Telegram—place orders, browse events, and get alerts without leaving the app. Your automated command center for crypto prediction markets.
 
